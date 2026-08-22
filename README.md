@@ -1,8 +1,8 @@
 # registree
 
 [![test](https://github.com/aucontraire/registree/actions/workflows/test.yml/badge.svg)](https://github.com/aucontraire/registree/actions/workflows/test.yml)
-[![PyPI](https://img.shields.io/pypi/v/registree)](https://pypi.org/project/registree/)
-[![Python](https://img.shields.io/pypi/pyversions/registree)](https://pypi.org/project/registree/)
+[![PyPI](https://img.shields.io/pypi/v/registree?cacheSeconds=3600)](https://pypi.org/project/registree/)
+[![Python](https://img.shields.io/pypi/pyversions/registree?cacheSeconds=3600)](https://pypi.org/project/registree/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 An anti-hallucination class registry for coding agents, served over
