@@ -88,9 +88,10 @@ anything else that speaks MCP over stdio. Structured tool output degrades
 gracefully for clients that only read text content.
 
 The **hook adapters** (`hook-check`, `hook-regen`) target Claude Code's hook
-protocol, which can intercept a pending file edit and hand the model
-advisory feedback *before* the write lands — a deterministic checkpoint the
-MCP layer alone can't provide. See [docs/claude-code.md](docs/claude-code.md).
+protocol, which can intercept a pending file edit — or Python about to be
+run through a quoted shell heredoc — and hand the model advisory feedback
+*before* it lands, a deterministic checkpoint the MCP layer alone can't
+provide. See [docs/claude-code.md](docs/claude-code.md).
 
 That protocol is spreading: VS Code Copilot agent mode (Preview) reads the
 same format — same events, same stdin JSON, even `.claude/settings.json` —

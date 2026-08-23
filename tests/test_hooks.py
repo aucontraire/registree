@@ -11,7 +11,12 @@ import pytest
 
 from registree.config import RegistreeConfig
 from registree.generator import generate_registry, write_registry
-from registree.hooks import hook_check, pending_content
+from registree.hooks import (
+    hook_check,
+    pending_content,
+    pending_shell_python,
+    shell_python_blocks,
+)
 
 
 def test_write_payload_carries_full_content() -> None:
@@ -34,6 +39,137 @@ def test_edit_payload_is_applied_to_disk_content(tmp_path: Path) -> None:
     )
     assert path == str(target)
     assert content == "value = 2\n"
+
+
+BAD_CALL = (
+    "from widgetlib.gadgets import Gadget\nGadget(name='x', flag=True, colour='red')\n"
+)
+
+
+def test_quoted_heredoc_after_python_is_extracted() -> None:
+    blocks = shell_python_blocks(f"python - <<'PY'\n{BAD_CALL}PY\n")
+    assert blocks == [BAD_CALL]
+
+
+def test_extraction_survives_redirection_and_pipes_after_the_marker() -> None:
+    """The marker is rarely the end of the line in practice."""
+    command = f"uv run python - <<'PY' 2>&1 | tail -5\n{BAD_CALL}PY\n"
+    assert shell_python_blocks(command) == [BAD_CALL]
+
+
+def test_extraction_handles_an_interpreter_behind_a_wrapper() -> None:
+    command = f"docker exec -i box python - <<'PY'\n{BAD_CALL}PY\n"
+    assert shell_python_blocks(command) == [BAD_CALL]
+
+
+def test_double_quoted_and_dash_forms_are_extracted() -> None:
+    assert shell_python_blocks(f'python3 - <<"PY"\n{BAD_CALL}PY\n') == [BAD_CALL]
+    assert shell_python_blocks(f"python3.12 - <<-'PY'\n{BAD_CALL}\tPY\n") == [BAD_CALL]
+
+
+def test_unquoted_heredoc_is_ignored() -> None:
+    """Its body is a shell template. Checking pre-expansion text would mean
+    reporting on source that never runs."""
+    assert shell_python_blocks(f"python - <<PY\n{BAD_CALL}PY\n") == []
+
+
+def test_heredoc_not_fed_to_python_is_ignored() -> None:
+    assert (
+        shell_python_blocks("cat <<'EOF' > notes.txt\nGadget(colour='red')\nEOF\n")
+        == []
+    )
+
+
+def test_python_dash_c_is_not_covered() -> None:
+    """A documented limitation, asserted so it cannot regress silently."""
+    assert shell_python_blocks("python -c \"Gadget(colour='red')\"") == []
+
+
+def test_unterminated_heredoc_yields_nothing() -> None:
+    """Guessing where an unfinished body ends would invent source."""
+    assert shell_python_blocks(f"python - <<'PY'\n{BAD_CALL}") == []
+
+
+def test_multiple_heredocs_are_all_extracted() -> None:
+    command = (
+        f"python - <<'PY'\n{BAD_CALL}PY\n"
+        "echo between\n"
+        f"python - <<'EOF'\nx = 1\nEOF\n"
+    )
+    assert shell_python_blocks(command) == [BAD_CALL, "x = 1\n"]
+
+
+def test_a_marker_inside_a_body_does_not_start_a_second_block() -> None:
+    """Scanning must resume past the terminator, not inside the body."""
+    body = "text = \"python - <<'INNER'\"\n"
+    assert shell_python_blocks(f"python - <<'PY'\n{body}PY\n") == [body]
+
+
+def test_command_without_python_or_heredoc_exits_on_a_substring_test() -> None:
+    """The cheap rejection that keeps this off the critical path of every
+    unrelated Bash call."""
+    assert shell_python_blocks("ls -la && grep -rn 'python' README.md") == []
+    assert shell_python_blocks("cat <<'EOF'\nhello\nEOF\n") == []
+
+
+def test_pending_shell_python_reads_the_command_field() -> None:
+    assert pending_shell_python({"command": f"python - <<'PY'\n{BAD_CALL}PY\n"}) == [
+        BAD_CALL
+    ]
+    assert pending_shell_python({"file_path": "/tmp/x.py"}) == []
+
+
+def test_hook_check_flags_a_constructor_call_run_through_a_heredoc(
+    sample_project: Path,
+    sample_config: RegistreeConfig,
+    sample_registry_doc: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The end-to-end gap this closes: code executed by shell, never written."""
+    write_registry(sample_config, sample_registry_doc)
+    payload = {
+        "tool_name": "Bash",
+        "tool_input": {"command": f"python - <<'PY'\n{BAD_CALL}PY\n"},
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+
+    assert hook_check(root=sample_project) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    context = emitted["hookSpecificOutput"]["additionalContext"]
+    assert "pending command" in context
+    assert "colour" in context
+
+
+def test_hook_check_is_silent_on_a_bash_call_with_no_python(
+    sample_project: Path,
+    sample_config: RegistreeConfig,
+    sample_registry_doc: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    write_registry(sample_config, sample_registry_doc)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "ls -la | head"}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+
+    assert hook_check(root=sample_project) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_hook_check_does_not_touch_the_registry_for_an_ordinary_command(
+    sample_project: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No registry read, no config discovery — the substring test must reject
+    before any I/O, because this now runs on every Bash call."""
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git status --short"}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+
+    def _explode(*args: object, **kwargs: object) -> None:
+        raise AssertionError("registry must not be read for an ordinary command")
+
+    monkeypatch.setattr("registree.hooks.RegistreeConfig.discover", _explode)
+    assert hook_check(root=sample_project) == 0
 
 
 def test_hook_check_emits_additional_context_and_exits_zero(
