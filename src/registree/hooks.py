@@ -29,6 +29,7 @@ hooks in (the project root), so one hook command works in every project.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -116,14 +117,108 @@ def pending_content(tool_input: dict[str, Any]) -> tuple[str | None, str | None]
     return path, None
 
 
+# ── shell-executed Python ────────────────────────────────────────────────────
+
+# A heredoc whose delimiter is QUOTED (<<'PY', <<"PY", <<-'PY'). The quoting is
+# the whole point: it tells the shell to pass the body through literally, with
+# no $variable, `backtick` or $(...) expansion — so what the hook reads is
+# exactly what Python will receive. An UNQUOTED <<PY is deliberately not
+# matched; its body is a shell template, and checking the pre-expansion text
+# would mean checking source that never runs.
+_HEREDOC_START = re.compile(
+    r"<<-?\s*(?P<q>['\"])(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P=q)"
+)
+
+# `python`, `python3`, `python3.12` — as a word, so `mypython` does not match.
+_PYTHON_INVOCATION = re.compile(r"(?:^|[\s|;&(])python[0-9.]*(?:\s|$)")
+
+
+def shell_python_blocks(command: str) -> list[str]:
+    """Python source fed to an interpreter through a quoted heredoc.
+
+    Covers the idiom that dominates agent shell use::
+
+        python - <<'PY'      docker exec -i box python - <<'PY'
+        ...                  uv run python - <<'PY' 2>&1 | tail
+
+    and deliberately covers nothing else. ``python -c "..."`` needs shell
+    quote-parsing to recover, and an unquoted heredoc is a template rather
+    than source; both are left to the caller and are documented as uncovered.
+    See issue #4 for why the wider Bash-parsing option was not taken.
+
+    Every failure mode here is safe: a body extracted wrongly either fails to
+    parse, and ``check_source`` is silent on unparseable input, or parses as a
+    subset, whose findings are still true of the code being run.
+    """
+    # Cheap rejection first. This runs on EVERY Bash call, and the overwhelming
+    # majority embed no Python at all; nothing below should touch the registry
+    # or the filesystem before these two substring tests fail.
+    if "<<" not in command or "python" not in command:
+        return []
+
+    out: list[str] = []
+    pos = 0
+    while (match := _HEREDOC_START.search(command, pos)) is not None:
+        pos = match.end()
+
+        # The interpreter has to be named on the same line, before the marker.
+        line_start = command.rfind("\n", 0, match.start()) + 1
+        if not _PYTHON_INVOCATION.search(command[line_start : match.start()]):
+            continue
+
+        # The body opens on the next line — anything else on this one is
+        # redirection or a pipeline, not source.
+        newline = command.find("\n", match.end())
+        if newline == -1:
+            continue
+        body_start = newline + 1
+
+        terminator = re.compile(
+            rf"^[ \t]*{re.escape(match.group('delim'))}[ \t]*$", re.MULTILINE
+        )
+        end = terminator.search(command, body_start)
+        if end is None:
+            # Unterminated: the heredoc is still being written, or the payload
+            # was truncated. Guessing where it ends would invent source.
+            continue
+
+        body = command[body_start : end.start()]
+        if body.strip():
+            out.append(body)
+        pos = end.end()
+
+    return out
+
+
+def pending_shell_python(tool_input: dict[str, Any]) -> list[str]:
+    """Python blocks from a pending Bash command, or []."""
+    command = tool_input.get("command") or tool_input.get("cmd")
+    if not isinstance(command, str):
+        return []
+    return shell_python_blocks(command)
+
+
 # ── PreToolUse: constructor check ────────────────────────────────────────────
 
 
 def hook_check(root: Path | None = None, registry_path: Path | None = None) -> int:
     try:
         tool_input = _tool_input(sys.stdin.read())
+
         path, content = pending_content(tool_input)
-        if not path or not path.endswith(".py") or content is None:
+        if path and path.endswith(".py") and content is not None:
+            # A file write: the checker gets the path too, which lets it prefer
+            # a class defined in this very file over a same-named one elsewhere.
+            sources: list[tuple[str | None, str]] = [(path, content)]
+            subject = "pending edit"
+        else:
+            # A shell command running Python that will never touch a file.
+            # Deliberately after the write branch, and gated on a substring
+            # test, so the common Bash call costs two `in` checks and no I/O.
+            sources = [(None, block) for block in pending_shell_python(tool_input)]
+            subject = "pending command"
+
+        if not sources:
             return 0
 
         config = RegistreeConfig.discover(
@@ -132,17 +227,21 @@ def hook_check(root: Path | None = None, registry_path: Path | None = None) -> i
         data = json.loads(config.registry_path.read_text(encoding="utf-8"))
         reg = Registry.from_document(data if isinstance(data, dict) else {})
 
-        findings = check_source(
-            content,
-            reg,
-            path,
-            root=config.root,
-            root_packages=config.root_packages,
-        )
+        findings: list[str] = []
+        for source_path, source in sources:
+            findings.extend(
+                check_source(
+                    source,
+                    reg,
+                    source_path,
+                    root=config.root,
+                    root_packages=config.root_packages,
+                )
+            )
         if not findings:
             return 0
 
-        body = "Class registry check on the pending edit:\n" + "\n".join(
+        body = f"Class registry check on the {subject}:\n" + "\n".join(
             f"  - {f}" for f in findings
         )
         print(
