@@ -134,6 +134,69 @@ class Registry:
 
         return accepted
 
+    def methods(self, entry: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+        """Every method callable on the class, and whether that list is whole.
+
+        ``accepted_keywords`` answers "may the constructor take this name";
+        this answers "does this class have this method" — the question behind
+        a hallucinated ``client.get_items()`` when the method is
+        ``fetch_items()``.
+
+        Inherited methods are included, because a list of only the class's own
+        body would report a real inherited method as absent — manufacturing
+        exactly the false negative this tool exists to prevent. Ancestors are
+        walked breadth-first and the most-derived definition of a name wins,
+        which approximates MRO and matches how an override actually resolves.
+
+        Returns ``(methods, complete)``. ``complete`` is False when an ancestor
+        could not be resolved — unknown, ambiguous, or a framework base outside
+        the scan such as ``BaseModel``, whose own methods can never appear here.
+        **A listed method exists; absence from an incomplete list is not
+        evidence that a method does not.** The list is never None, because the
+        names that were found stay true regardless of the ones that were not.
+
+        ``__init__`` is omitted: it is already reported verbatim as
+        ``init_signature``, and repeating it would pad every response.
+        """
+        out: list[dict[str, Any]] = []
+        by_name: set[str] = set()
+        seen: set[str] = set()
+        complete = True
+        queue: list[dict[str, Any]] = [entry]
+
+        while queue:
+            cls = queue.pop(0)
+            name = cls.get("name")
+            if not isinstance(name, str) or name in seen:
+                continue
+            seen.add(name)
+
+            for m in cls.get("methods") or []:
+                mname = m.get("name")
+                if not isinstance(mname, str) or mname == "__init__":
+                    continue
+                if mname in by_name:
+                    # A more-derived class already defined it; that one wins.
+                    continue
+                by_name.add(mname)
+                out.append({**m, "defined_in": name})
+
+            for parent in cls.get("parent_classes") or []:
+                short = _short(parent)
+                if short in INERT_BASES:
+                    # Skipped for keyword purposes, but a framework base does
+                    # carry methods we cannot see, so the list is not whole.
+                    complete = False
+                    continue
+                candidates = self.get(short)
+                if len(candidates) != 1:
+                    complete = False
+                    continue
+                queue.append(candidates[0])
+
+        out.sort(key=lambda m: str(m.get("name", "")))
+        return out, complete
+
     def required_params(
         self, entry: dict[str, Any]
     ) -> tuple[list[str], set[str]] | None:

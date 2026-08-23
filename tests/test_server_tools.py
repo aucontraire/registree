@@ -71,6 +71,87 @@ def test_get_signature_says_unknowable_not_empty(
     assert definition.required_arguments is None
 
 
+def test_get_signature_surfaces_methods(provider: RegistryProvider) -> None:
+    """The regression this exists for: a real method name must be visible.
+
+    Without it a caller cannot tell ``fetch_items`` from a hallucinated
+    ``get_items``, which is the failure that motivated the feature.
+    """
+    definition = get_signature("WidgetClient").definitions[0]
+    names = {m.name for m in definition.methods}
+    assert "fetch_items" in names
+    assert "get_items" not in names
+
+
+def test_get_signature_omits_init_from_methods(provider: RegistryProvider) -> None:
+    definition = get_signature("WidgetClient").definitions[0]
+    assert "__init__" not in {m.name for m in definition.methods}
+    # ...because it is still reported, verbatim, where it always was.
+    assert definition.init_signature is not None
+    assert "api_key" in definition.init_signature
+
+
+def test_get_signature_reports_method_kind(provider: RegistryProvider) -> None:
+    """A property is read, a classmethod is called on the class. Confusing
+    those is its own error, distinct from getting the name wrong."""
+    by_name = {m.name: m for m in get_signature("WidgetClient").definitions[0].methods}
+    assert by_name["is_configured"].kind == "property"
+    assert by_name["from_env"].kind == "classmethod"
+    assert by_name["normalize"].kind == "staticmethod"
+    assert by_name["fetch_items"].kind == "instance"
+    assert by_name["refresh"].is_async
+    assert not by_name["fetch_items"].is_async
+    # **options makes this method's keywords unknowable, and it says so.
+    assert by_name["refresh"].accepts_kwargs
+    assert not by_name["fetch_items"].accepts_kwargs
+
+
+def test_get_signature_includes_inherited_methods(
+    provider: RegistryProvider,
+) -> None:
+    """Listing only the class's own body would report a real inherited method
+    as absent — the exact false negative registree exists to prevent."""
+    by_name = {m.name: m for m in get_signature("WidgetClient").definitions[0].methods}
+    assert "fetch_items" in by_name
+    assert by_name["fetch_items"].defined_in == "BaseClient"
+    assert by_name["is_configured"].defined_in == "WidgetClient"
+
+
+def test_get_signature_override_resolves_to_derived(
+    provider: RegistryProvider,
+) -> None:
+    """Both classes define close(); the derived one wins, and it appears once."""
+    methods = get_signature("WidgetClient").definitions[0].methods
+    closes = [m for m in methods if m.name == "close"]
+    assert len(closes) == 1
+    assert closes[0].defined_in == "WidgetClient"
+
+
+def test_get_signature_methods_complete_is_honest(
+    provider: RegistryProvider,
+) -> None:
+    """Every ancestor resolved -> whole list. A framework base outside the
+    scan -> not whole, because its methods can never appear here."""
+    assert get_signature("WidgetClient").definitions[0].methods_complete
+    assert get_signature("BaseClient").definitions[0].methods_complete
+
+    pydantic = next(
+        d for d in get_signature("Widget").definitions if d.type == "pydantic_model"
+    )
+    # Widget -> BaseWidgetModel -> BaseModel: BaseModel's methods are unseen.
+    assert not pydantic.methods_complete
+
+
+def test_get_signature_methods_empty_but_not_none(
+    provider: RegistryProvider,
+) -> None:
+    """A class with only __init__ reports [] — an honest empty, not a null,
+    because the names that were found stay true regardless."""
+    definition = get_signature("Gadget").definitions[0]
+    assert definition.methods == []
+    assert definition.methods_complete
+
+
 def test_get_signature_not_found_suggests_similar(
     provider: RegistryProvider,
 ) -> None:

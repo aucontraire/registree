@@ -91,6 +91,43 @@ FIXTURE_FILES: dict[str, str] = {
         "def to_domain(row: WidgetDB) -> Widget:\n"
         '    return Widget(name="w")\n'
     ),
+    # A client whose real method is fetch_items, so a hallucinated get_items
+    # has something concrete to be caught against; plus a subclass, to prove
+    # inherited methods are reported and overrides resolve to the derived one.
+    "src/widgetlib/clients.py": (
+        "class BaseClient:\n"
+        "    def fetch_items(self, ids: list[str]) -> list[str]:\n"
+        "        return []\n"
+        "\n"
+        "    def close(self) -> None:\n"
+        "        pass\n"
+        "\n"
+        "\n"
+        "class WidgetClient(BaseClient):\n"
+        "    def __init__(self, api_key: str) -> None:\n"
+        "        self.api_key = api_key\n"
+        "\n"
+        "    @property\n"
+        "    def is_configured(self) -> bool:\n"
+        "        return True\n"
+        "\n"
+        "    @classmethod\n"
+        "    def from_env(cls) -> 'WidgetClient':\n"
+        "        return cls(api_key='x')\n"
+        "\n"
+        "    @staticmethod\n"
+        "    def normalize(value: str) -> str:\n"
+        "        return value.strip()\n"
+        "\n"
+        "    async def refresh(self, **options: object) -> None:\n"
+        "        return None\n"
+        "\n"
+        "    def close(self) -> None:\n"
+        "        pass\n"
+        "\n"
+        "    def _fetch_batch(self, ids: list[str]) -> list[str]:\n"
+        "        return []\n"
+    ),
     "tests/__init__.py": "",
     "tests/test_sample.py": "class SampleCase:\n    pass\n",
 }

@@ -45,7 +45,9 @@ mcp = MCPServer(
         "Query a static class registry before writing code that instantiates "
         "existing classes. Class names map to LISTS of definitions: an "
         "ambiguous name returns every definition, never a silent first "
-        "match. Use get_signature before writing a constructor call, "
+        "match. Use get_signature before writing a constructor call OR a "
+        "method call — it reports the class's methods, so a guessed method "
+        "name can be checked instead of assumed. "
         "verify_snippet after drafting code, get_usages before renaming, "
         "and list_duplicates to see which names need an import to "
         "disambiguate."
@@ -154,6 +156,20 @@ class FieldSummary(BaseModel):
     description: str | None
 
 
+class MethodSummary(BaseModel):
+    name: str
+    signature: str | None
+    # instance | property | classmethod | staticmethod
+    kind: str
+    is_async: bool
+    # True when the method soaks up **kwargs, so its keywords are unknowable.
+    accepts_kwargs: bool
+    returns: str | None
+    # Which class in the MRO supplied it, so an inherited method is traceable
+    # rather than mistaken for one defined here.
+    defined_in: str
+
+
 class Definition(BaseModel):
     file_path: str
     line_number: int
@@ -164,6 +180,11 @@ class Definition(BaseModel):
     summary: str | None
     init_signature: str | None
     fields: list[FieldSummary]
+    # Callable surface, inherited methods included, ``__init__`` excluded (it
+    # is init_signature). A listed method exists; when methods_complete is
+    # False an unlisted one may exist too — absence is not evidence.
+    methods: list[MethodSummary]
+    methods_complete: bool
     # None means "unknowable": an open-ended constructor (**kwargs, Pydantic
     # extra=/alias=) or an ancestor outside the registry. A None here is a
     # statement of honest uncertainty, not an empty list.
@@ -250,6 +271,22 @@ def _first_line(docstring: str | None) -> str | None:
     return docstring.strip().split("\n", 1)[0].strip() or None
 
 
+def _method_kind(m: dict[str, Any]) -> str:
+    """Descriptor kind — how the method is reached, not just its name.
+
+    A property is read (``obj.ready``) and a classmethod is called on the
+    class; getting that wrong is its own failure, distinct from getting the
+    name wrong, and the generator already records both.
+    """
+    if m.get("is_property"):
+        return "property"
+    if m.get("is_classmethod"):
+        return "classmethod"
+    if m.get("is_staticmethod"):
+        return "staticmethod"
+    return "instance"
+
+
 def _build_definition(entry: dict[str, Any], reg: Registry) -> Definition:
     init_signature: str | None = None
     for m in entry.get("methods") or []:
@@ -260,6 +297,7 @@ def _build_definition(entry: dict[str, Any], reg: Registry) -> Definition:
     spec = reg.required_params(entry)
     required = sorted(spec[1]) if spec is not None else None
     accepted = reg.accepted_keywords(entry)
+    methods, methods_complete = reg.methods(entry)
 
     return Definition(
         file_path=str(entry.get("file_path", "")),
@@ -282,6 +320,19 @@ def _build_definition(entry: dict[str, Any], reg: Registry) -> Definition:
         ],
         required_arguments=required,
         accepted_keywords=sorted(accepted) if accepted is not None else None,
+        methods=[
+            MethodSummary(
+                name=str(m.get("name", "")),
+                signature=m.get("signature"),
+                kind=_method_kind(m),
+                is_async=bool(m.get("is_async")),
+                accepts_kwargs=bool(m.get("accepts_kwargs")),
+                returns=m.get("return_type"),
+                defined_in=str(m.get("defined_in", "")),
+            )
+            for m in methods
+        ],
+        methods_complete=methods_complete,
     )
 
 
@@ -320,10 +371,14 @@ def server_info() -> ServerInfo:
 
 @mcp.tool()
 def get_signature(class_name: str) -> SignatureResult:
-    """Constructor contract for a class — EVERY definition if the name is
-    duplicated. Call this before writing an instantiation: it reports the
-    required arguments, the accepted keywords, and honest ``null`` when a
-    constructor is open-ended or unknowable."""
+    """Constructor contract AND callable surface for a class — EVERY
+    definition if the name is duplicated. Call this before writing an
+    instantiation or a method call: it reports the required arguments, the
+    accepted keywords, honest ``null`` when a constructor is open-ended or
+    unknowable, and the class's ``methods`` (inherited included, each with its
+    kind and defining class) so a method name can be verified rather than
+    guessed. When ``methods_complete`` is false an ancestor was unresolvable,
+    so a listed method exists but an unlisted one still might."""
     provider = _require_provider()
     doc = provider.document()
     reg = provider.registry()

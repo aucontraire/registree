@@ -40,7 +40,7 @@ Two principles run through every tool:
 
 | tool | use it |
 |---|---|
-| `get_signature` | before writing a constructor call — required args, accepted keywords, every definition of a duplicated name |
+| `get_signature` | before writing a constructor **or method** call — required args, accepted keywords, the class's methods (inherited included), every definition of a duplicated name |
 | `verify_snippet` | after drafting code — checks constructor calls against the registry |
 | `search_classes` | when unsure of the exact class name |
 | `list_duplicates` | which names need an explicit import to disambiguate |
