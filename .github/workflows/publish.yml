@@ -1,7 +1,6 @@
 # Publishes to PyPI via Trusted Publishing (OIDC) — no API tokens stored.
-# Inert until the trusted publisher is configured on PyPI:
-#   PyPI -> project -> Publishing -> add GitHub publisher for
-#   aucontraire/registree, workflow publish.yml, environment pypi.
+# The trusted publisher is configured (project, workflow publish.yml,
+# environment pypi), so a published GitHub release runs this end to end.
 name: publish
 
 on:
