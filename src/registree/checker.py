@@ -1,6 +1,6 @@
-"""Constructor checking against the class registry.
+"""Constructor and method-call checking against the class registry.
 
-Inspects Python source for two things:
+Inspects Python source for:
 
   1. **Unknown keyword argument** — ``Foo(bar=...)`` where ``bar`` is not a
      field of ``Foo`` nor a parameter of its ``__init__``, anywhere up its
@@ -9,6 +9,13 @@ Inspects Python source for two things:
      arguments the call does not supply.
   3. **Ambiguous class name** — a call to a name that is defined multiple
      times with differing fields, and no import in the file disambiguates.
+  4. **Unknown method on ``self``** — ``self.get_items()`` inside a class
+     whose registry entry (with a whole method list) has no such method and
+     no field of that name. The receiver's type is the enclosing class, the
+     one case where it is known without inference.
+  5. **Property invoked as a method** — ``self.ready()`` where ``ready`` is a
+     ``@property``; the parentheses call the property's *result*, which is a
+     bug unless that result is itself callable.
 
 Silence is the default. Every uncertainty resolves to "say nothing":
 
@@ -62,6 +69,11 @@ INERT_BASES = {
 
 MAX_FINDINGS = 6
 
+# A class that intercepts attribute access has an open-ended surface: a name
+# absent from its method and field lists may still resolve at runtime. Meeting
+# one forces silence on the unknown-method check.
+_DYNAMIC_ATTR = {"__getattr__", "__getattribute__"}
+
 
 def _short(name: str) -> str:
     return name.split("[")[0].split(".")[-1].strip()
@@ -73,6 +85,12 @@ def _short(name: str) -> str:
 class Registry:
     def __init__(self, classes: dict[str, list[dict[str, Any]]]) -> None:
         self.classes = classes
+        # Names that appear as some class's parent, built once on first need.
+        # A base class with subclasses cannot have its `self.<name>()` calls
+        # judged for unknown names: `self` may be a more-derived instance that
+        # defines the name (the template-method pattern), so absence from the
+        # base is not absence at runtime.
+        self._subclassed_cache: set[str] | None = None
 
     @classmethod
     def from_document(cls, document: dict[str, Any]) -> Registry:
@@ -81,6 +99,17 @@ class Registry:
 
     def get(self, name: str) -> list[dict[str, Any]]:
         return self.classes.get(name, [])
+
+    def has_subclass(self, name: str) -> bool:
+        """Whether any class in the registry lists ``name`` as a parent."""
+        if self._subclassed_cache is None:
+            acc: set[str] = set()
+            for entries in self.classes.values():
+                for entry in entries:
+                    for parent in entry.get("parent_classes") or []:
+                        acc.add(_short(parent))
+            self._subclassed_cache = acc
+        return name in self._subclassed_cache
 
     def accepted_keywords(self, entry: dict[str, Any]) -> set[str] | None:
         """Every keyword ``Name(...)`` may accept, or None if unknowable.
@@ -420,6 +449,229 @@ def _check_missing(
     )
 
 
+# ── self.<method>() checking ───────────────────────────────────────────────────
+
+
+def _has_property_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether ``node`` is decorated ``@property`` (bare or dotted)."""
+    for dec in node.decorator_list:
+        rendered = ast.unparse(dec) if not isinstance(dec, ast.Call) else ""
+        if rendered == "property" or rendered.endswith(".property"):
+            return True
+    return False
+
+
+def _property_result_maybe_callable(return_type: str | None) -> bool:
+    """Whether a property's annotated result might itself be callable.
+
+    ``obj.handler()`` is *correct* when ``handler`` is a property returning a
+    callable — the call lands on the returned object, not the property. Only a
+    plainly non-callable annotation makes the call a bug, so an absent, ``Any``,
+    or ``Callable`` annotation buys silence. A concrete class that happens to
+    define ``__call__`` is a residual, rare miss accepted in exchange for not
+    flagging correct code.
+    """
+    if not return_type:
+        return True
+    low = return_type.lower()
+    return low == "any" or "callable" in low
+
+
+def _self_attr_names(target: ast.expr) -> set[str]:
+    """Names bound by a ``self.x = ...`` target, tuple-unpacking included."""
+    if (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    ):
+        return {target.attr}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for elt in target.elts:
+            names |= _self_attr_names(elt)
+        return names
+    return set()
+
+
+def _local_members(
+    cls: ast.ClassDef,
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    """Methods, class-level fields, and instance attributes seen in ``cls``.
+
+    Local definitions are authoritative for *existence*: a member drafted in
+    the very snippet being checked must never read as unknown just because the
+    registry has not been regenerated yet. They only ever add to what is known
+    — completeness is still decided by the registry, because an ``Edit`` may
+    show a fragment of the class rather than the whole body.
+    """
+    methods: dict[str, dict[str, Any]] = {}
+    fields: set[str] = set()
+    for item in cls.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            methods[item.name] = {
+                "is_property": _has_property_decorator(item),
+                "return_type": ast.unparse(item.returns) if item.returns else None,
+            }
+        elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+            fields.add(item.target.id)
+        elif isinstance(item, ast.Assign):
+            for target in item.targets:
+                if isinstance(target, ast.Name):
+                    fields.add(target.id)
+
+    # Instance attributes bound anywhere in the body (`self.x = ...`), covering
+    # annotated and augmented assignment and tuple unpacking. These hold
+    # arbitrary values — a constructor-injected callable invoked as
+    # ``self._factory()`` is the common one — so a name bound this way is a
+    # known attribute, never an unknown method. Over-collecting across nested
+    # scopes only adds silence, the safe direction.
+    for sub in ast.walk(cls):
+        if isinstance(sub, ast.Assign):
+            for target in sub.targets:
+                fields |= _self_attr_names(target)
+        elif isinstance(sub, (ast.AnnAssign, ast.AugAssign)):
+            fields |= _self_attr_names(sub.target)
+
+    return methods, fields
+
+
+def _self_calls(tree: ast.AST) -> list[tuple[ast.Call, ast.ClassDef]]:
+    """Every ``self.<attr>(...)`` written directly in a method of a class.
+
+    Pairs each such call with the class whose instance ``self`` names. The
+    association holds only inside a method (first parameter ``self``) written
+    directly in the class body: a nested function or a nested class ends it,
+    because there the binding of ``self`` is no longer guaranteed to be this
+    class's instance, and guessing is the one thing this tool refuses to do.
+    """
+    out: list[tuple[ast.Call, ast.ClassDef]] = []
+
+    def walk(node: ast.AST, owner: ast.ClassDef | None) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                walk(child, None)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                positional = child.args.posonlyargs + child.args.args
+                first = positional[0].arg if positional else None
+                if isinstance(node, ast.ClassDef) and first == "self":
+                    walk(child, node)
+                else:
+                    walk(child, None)
+            else:
+                if (
+                    owner is not None
+                    and isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and isinstance(child.func.value, ast.Name)
+                    and child.func.value.id == "self"
+                ):
+                    out.append((child, owner))
+                walk(child, owner)
+
+    walk(tree, None)
+    return out
+
+
+def _check_self_method(
+    call: ast.Call,
+    cls: ast.ClassDef,
+    reg: Registry,
+    imports: dict[str, str],
+    file_path: str | None,
+    root: Path | None,
+    root_packages: tuple[str, ...],
+    findings: list[str],
+    reported: set[str],
+) -> None:
+    """Flag ``self.<attr>()`` that names a property or a nonexistent method."""
+    func = call.func
+    assert isinstance(func, ast.Attribute)  # guaranteed by _self_calls
+    attr = func.attr
+    # Dunders (``self.__class__()``, ``self.__post_init__()``) carry special
+    # runtime semantics; leave them alone.
+    if attr.startswith("__"):
+        return
+
+    local_methods, local_fields = _local_members(cls)
+
+    def report_property(where: str) -> None:
+        key = f"{cls.name}.{attr}:property"
+        if key in reported:
+            return
+        reported.add(key)
+        findings.append(
+            f"`self.{attr}()` calls `{attr}`, a property on `{cls.name}`{where} "
+            f"— a property is read as `self.{attr}` without parentheses."
+        )
+
+    # A member defined in the snippet itself is authoritative — but a property
+    # is still a property.
+    local = local_methods.get(attr)
+    if local is not None:
+        if local["is_property"] and not _property_result_maybe_callable(
+            local["return_type"]
+        ):
+            report_property("")
+        return
+
+    entries = _resolve(
+        cls.name, reg.get(cls.name), imports, file_path, root, root_packages
+    )
+    if len(entries) != 1:
+        # The class is not in the registry, or is ambiguous. Local evidence was
+        # already exhausted above; inherited methods are unknowable, so any
+        # remaining name is uncertain -> silent.
+        return
+    entry = entries[0]
+
+    methods, complete = reg.methods(entry)
+    known = {str(m.get("name")) for m in methods}
+    match = next((m for m in methods if m.get("name") == attr), None)
+    if match is not None:
+        # A property in the resolved list is a property even when the list is
+        # incomplete: an unresolved ancestor is *less* derived and cannot
+        # override the definition we can see.
+        if match.get("is_property") and not _property_result_maybe_callable(
+            match.get("return_type")
+        ):
+            where = f" ({entry['file_path']}:{entry['line_number']})"
+            report_property(where)
+        return
+
+    # Not a known method. Every remaining path is a reason to stay silent
+    # except the last: a whole method list on a class no subclass extends.
+    accepted = reg.accepted_keywords(entry)
+    if accepted is None or attr in accepted or attr in local_fields:
+        return  # a field, or an open-ended (extra/alias/**kwargs) surface
+    if not complete:
+        return  # an ancestor was unresolvable; absence is not evidence
+    if known & _DYNAMIC_ATTR or local_methods.keys() & _DYNAMIC_ATTR:
+        return  # attribute access is intercepted
+    if reg.has_subclass(cls.name):
+        return  # `self` may be a subclass instance that defines `attr`
+
+    # Only claim "unknown" when the snippet shows the whole class body. When the
+    # registry knows own methods this snippet omits, it is a fragment (an Edit
+    # of one method), and an instance attribute set in the unseen `__init__`
+    # would read as an unknown method — the false positive found on real code.
+    registry_own = {
+        str(m.get("name")) for m in entry.get("methods") or [] if m.get("name")
+    }
+    if not registry_own <= set(local_methods):
+        return
+
+    key = f"{cls.name}.{attr}:unknownmethod"
+    if key in reported:
+        return
+    reported.add(key)
+    sample = sorted(n for n in known if not n.startswith("_"))[:8]
+    findings.append(
+        f"`self.{attr}()` is not a known method of `{cls.name}` "
+        f"({entry['file_path']}:{entry['line_number']}). "
+        f"Known methods include: {sample}."
+    )
+
+
 def analyse(
     tree: ast.AST,
     reg: Registry,
@@ -429,7 +681,7 @@ def analyse(
     root_packages: tuple[str, ...] = (),
     max_findings: int = MAX_FINDINGS,
 ) -> list[str]:
-    """Check every constructor call in ``tree`` against the registry."""
+    """Check constructor and ``self`` method calls in ``tree``."""
     findings: list[str] = []
     reported: set[str] = set()
     imports = _import_map(tree)
@@ -488,6 +740,21 @@ def analyse(
             f"{sorted(accepted)}"
             + (f"; required: {required}" if required else "")
             + "."
+        )
+
+    for call, cls in _self_calls(tree):
+        if id(call) in exempt:
+            continue
+        _check_self_method(
+            call,
+            cls,
+            reg,
+            imports,
+            file_path,
+            root,
+            root_packages,
+            findings,
+            reported,
         )
 
     return findings[:max_findings]
